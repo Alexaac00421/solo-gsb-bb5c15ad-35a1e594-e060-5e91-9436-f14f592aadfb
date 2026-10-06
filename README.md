@@ -1,9 +1,9 @@
 # 批处理任务编排服务（Python + FastAPI + SQLite）
 
 外部工作进程通过 HTTP 领取并执行任务的批处理编排服务。支持以 DAG 描述工作流、
-幂等提交、租约令牌、失败重试、租约到期回收、失败级联跳过、取消、状态查询与
-**重复上报受理回执**（上报后断连可安全重发）；所有状态保存在 SQLite，
-**进程/容器重启后状态、租约与已受理回执继续有效**。
+幂等提交、租约令牌、失败重试、租约到期回收、失败级联跳过、取消、**暂停/恢复调度**、
+状态查询与**重复上报受理回执**（上报后断连可安全重发）；所有状态保存在 SQLite，
+**进程/容器重启后状态、租约、暂停标记与已受理回执继续有效**。
 
 ## 1. 一键启动（Docker Compose）
 
@@ -66,6 +66,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/workflows` | 列出工作流（`limit`/`offset`） |
 | GET | `/workflows/{id}` | 查询工作流及全部任务状态 |
 | POST | `/workflows/{id}/cancel` | 取消工作流 |
+| POST | `/workflows/{id}/pause` | 暂停调度（停止新领取，保留租约与尝试次数） |
+| POST | `/workflows/{id}/resume` | 恢复调度 |
 | POST | `/workflows/{id}/claim` | 在指定工作流领取一个就绪任务 |
 | POST | `/claims/claim` | 跨所有工作流领取一个就绪任务 |
 | POST | `/tasks/{task_id}/succeed` | 持令牌报告成功 |
@@ -75,6 +77,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `failed`、`skipped`（因上游失败被跳过）、`cancelled`。
 
 工作流状态：`pending`、`running`、`succeeded`、`failed`、`cancelled`。
+暂停是独立于状态的 `paused` 标记（查询响应中布尔字段），不改变上述状态机。
 
 ### 语义约定
 
@@ -97,11 +100,21 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   不产生回执，重试仍按失效规则拒绝。
 - **失败/到期**：未达 `max_attempts` 回到 `pending` 可重领；达到上限置
   `failed`，其所有未完成后继递归置 `skipped`，其他分支继续执行。
+- **暂停/恢复**：`POST /workflows/{id}/pause` 对待运行（`pending`）或运行中
+  （`running`）的工作流生效，任务图、尝试次数与已发租约全部保留；暂停期间
+  两种领取方式都不再发任务（指定工作流领取返回 `409 workflow_paused`，
+  跨工作流领取自动跳过暂停的工作流），已领取任务仍可在原租约内上报，
+  租约到期仍按既有重试与失败级联规则处理；暂停期间所有任务终结时工作流
+  照常进入相应终态。`POST /workflows/{id}/resume` 恢复后按依赖关系与原
+  尝试次数继续领取。重复暂停/重复恢复幂等返回当前状态；对已终结
+  （`succeeded`/`failed`）或已取消的工作流请求暂停/恢复返回
+  `409 workflow_terminal`。暂停标记持久化，服务重启后保持。
 - **取消**：工作流置 `cancelled`，所有未完成（`pending`/`leased`）任务置
   `cancelled` 且租约令牌失效；已成功的任务保持成功。对终态工作流取消返回
-  `409 workflow_terminal`，对已取消工作流重复取消幂等成功。
-- **持久化**：状态、尝试计数、令牌哈希、租约截止时间全部落 SQLite
-  （WAL 模式），重启后保持；租约到期判断以落库的绝对截止时间为准。
+  `409 workflow_terminal`，对已取消工作流重复取消幂等成功。暂停中的工作流
+  取消语义相同。
+- **持久化**：状态、尝试计数、令牌哈希、租约截止时间与暂停标记全部落
+  SQLite（WAL 模式），重启后保持；租约到期判断以落库的绝对截止时间为准。
 
 ## 5. 调用示例
 
@@ -218,11 +231,47 @@ curl -s http://127.0.0.1:8000/workflows/<WORKFLOW_ID>
 curl -s -X POST http://127.0.0.1:8000/workflows/<WORKFLOW_ID>/cancel
 ```
 
-### 5.5 Python 示例脚本（仅标准库）
+### 5.5 暂停与恢复调度
+
+```bash
+# 暂停：保留任务图、尝试次数与已发租约，仅停止新领取
+curl -s -X POST http://127.0.0.1:8000/workflows/<WORKFLOW_ID>/pause
+# 200 {"id":"...","status":"running","paused":true,"updated_at":"..."}
+# 重复调用幂等，返回相同内容
+
+# 暂停期间：指定工作流领取返回明确冲突
+curl -s -X POST http://127.0.0.1:8000/workflows/<WORKFLOW_ID>/claim \
+  -H 'Content-Type: application/json' -d '{}'
+# 409 {"error":{"code":"workflow_paused",
+#       "message":"工作流已暂停，不能领取新任务；已领取任务仍可在原租约内上报",
+#       "workflow_id":"..."}}
+# 跨工作流领取（/claims/claim）自动跳过暂停的工作流，无其他任务时返回 204
+
+# 已领取任务在原租约内照常上报（成功/失败语义不变）
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/succeed \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"result\": \"rows=1024\"}"
+# 200 {"workflow_id":"...","task_id":"...","status":"succeeded","attempts":1}
+
+# 查询响应的 paused 字段显示当前是否暂停
+curl -s http://127.0.0.1:8000/workflows/<WORKFLOW_ID>
+# {"id":"...","status":"running","paused":true,...}
+
+# 恢复：按依赖关系与原尝试次数继续领取；重复恢复幂等
+curl -s -X POST http://127.0.0.1:8000/workflows/<WORKFLOW_ID>/resume
+# 200 {"id":"...","status":"running","paused":false,"updated_at":"..."}
+
+# 已终结（succeeded/failed）或已取消的工作流：暂停/恢复均返回明确冲突
+# 409 {"error":{"code":"workflow_terminal",
+#       "message":"工作流已处于终态 succeeded，不能暂停","status":"succeeded"}}
+```
+
+### 5.6 Python 示例脚本（仅标准库）
 
 ```bash
 python examples/client_demo.py          # 提交→幂等→冲突→重试→完成 全流程
 python examples/worker.py               # 通用工作进程（轮询 /claims/claim）
+python examples/pause_resume_demo.py    # 暂停→领取阻断→租约内上报→恢复→完成
 ```
 
 ## 6. 错误响应格式
@@ -236,7 +285,7 @@ python examples/worker.py               # 通用工作进程（轮询 /claims/cl
 | HTTP | code |
 | --- | --- |
 | 422 | `missing_dependency` / `duplicate_task_key` / `dependency_cycle` |
-| 409 | `idempotency_conflict` / `workflow_terminal` / `not_leased` / `report_conflict` |
+| 409 | `idempotency_conflict` / `workflow_terminal` / `not_leased` / `report_conflict` / `workflow_paused` |
 | 403 | `invalid_token` |
 | 404 | `workflow_not_found` / `task_not_found` |
 
@@ -250,6 +299,8 @@ python -m pytest -q
 覆盖：图校验三类拒绝、幂等提交/冲突、依赖门控、令牌鉴权与一次性、
 失败重试与上限级联、租约到期（懒回收 + 后台线程）、取消、
 重复上报回执（重放/冲突/重启后保持/令牌隔离）、未受理令牌失效规则、
+暂停/恢复（领取门控、租约内上报、到期级联、暂停中进入终态、幂等、
+终态/已取消冲突、取消暂停中工作流、重启后保持、老库迁移）、
 20 线程并发领取不重复分配、8 线程并发重复上报一致受理、
 跨“重启”状态与租约保持。
 
@@ -258,12 +309,12 @@ python -m pytest -q
 ```
 app/
   config.py    # 环境变量配置
-  db.py        # SQLite 连接、WAL、建表初始化
+  db.py        # SQLite 连接、WAL、建表初始化与老库迁移
   models.py    # 请求/响应模型
   errors.py    # 统一业务错误
-  service.py   # 核心业务逻辑（校验/幂等/领取/上报/级联/取消）
+  service.py   # 核心业务逻辑（校验/幂等/领取/上报/级联/取消/暂停恢复）
   main.py      # FastAPI 路由与后台租约回收
-examples/      # 调用示例（client_demo.py、worker.py）
+examples/      # 调用示例（client_demo.py、worker.py、pause_resume_demo.py）
 tests/         # pytest 测试
 Dockerfile
 docker-compose.yml

@@ -353,17 +353,26 @@ def claim_task(
 
         if workflow_id is not None:
             wf = conn.execute(
-                "SELECT id FROM workflows WHERE id = ?", (workflow_id,)
+                "SELECT id, paused FROM workflows WHERE id = ?", (workflow_id,)
             ).fetchone()
             if wf is None:
                 raise ServiceError(
                     "workflow_not_found", "工作流不存在", 404
                 )
+            if wf["paused"]:
+                raise ServiceError(
+                    "workflow_paused",
+                    "工作流已暂停，不能领取新任务；已领取任务仍可在原租约内上报",
+                    409,
+                    {"workflow_id": workflow_id},
+                )
 
-        # 依赖全部成功的 pending 任务；NOT EXISTS 保证任依赖未成功即不可领
+        # 依赖全部成功的 pending 任务；NOT EXISTS 保证任依赖未成功即不可领；
+        # 暂停的工作流（paused = 1）一律不出现在候选中
         sql = (
             "SELECT t.id, t.workflow_id FROM tasks t "
-            "WHERE t.status = 'pending' "
+            "JOIN workflows w ON w.id = t.workflow_id "
+            "WHERE t.status = 'pending' AND w.paused = 0 "
             + ("AND t.workflow_id = ? " if workflow_id else "")
             + "AND NOT EXISTS ("
             "  SELECT 1 FROM task_dependencies d "
@@ -558,6 +567,63 @@ def report_task(
 
 
 # --------------------------------------------------------------------------- #
+# 暂停 / 恢复
+# --------------------------------------------------------------------------- #
+def set_workflow_paused(
+    conn: sqlite3.Connection, workflow_id: str, paused: bool, now: str
+) -> dict[str, Any]:
+    """暂停/恢复调度。
+
+    只翻转 ``paused`` 标记：任务图、尝试次数与已发租约全部保留；
+    已领取任务仍可在原租约内上报，租约到期仍按既有规则回收/级联；
+    暂停期间所有任务终结时工作流照常进入终态。重复暂停/恢复幂等；
+    已终结或已取消的工作流返回 409 ``workflow_terminal``。
+    """
+    action = "暂停" if paused else "恢复"
+    with transaction(conn):
+        wf = conn.execute(
+            "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if wf is None:
+            raise ServiceError("workflow_not_found", "工作流不存在", 404)
+
+        # 先懒回收到期租约并做终结判定，使冲突检查基于最新状态
+        affected = expire_leases(conn, now)
+        affected.add(workflow_id)
+        for wf_id in affected:
+            finalize_workflow(conn, wf_id, now)
+        wf = conn.execute(
+            "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+
+        if wf["status"] not in ("pending", "running"):
+            raise ServiceError(
+                "workflow_terminal",
+                f"工作流已处于终态 {wf['status']}，不能{action}",
+                409,
+                {"status": wf["status"]},
+            )
+        if bool(wf["paused"]) == paused:
+            # 重复暂停/恢复：幂等返回当前状态，不更新 updated_at
+            return {
+                "id": workflow_id,
+                "status": wf["status"],
+                "paused": paused,
+                "updated_at": wf["updated_at"],
+            }
+        conn.execute(
+            "UPDATE workflows SET paused = ?, updated_at = ? WHERE id = ?",
+            (1 if paused else 0, now, workflow_id),
+        )
+        return {
+            "id": workflow_id,
+            "status": wf["status"],
+            "paused": paused,
+            "updated_at": now,
+        }
+
+
+# --------------------------------------------------------------------------- #
 # 取消
 # --------------------------------------------------------------------------- #
 def cancel_workflow(
@@ -671,6 +737,7 @@ def _load_detail(conn: sqlite3.Connection, workflow_id: str) -> dict[str, Any]:
     return {
         "id": wf["id"],
         "status": wf["status"],
+        "paused": bool(wf["paused"]),
         "idempotency_key": wf["idempotency_key"],
         "default_max_attempts": wf["default_max_attempts"],
         "created_at": wf["created_at"],

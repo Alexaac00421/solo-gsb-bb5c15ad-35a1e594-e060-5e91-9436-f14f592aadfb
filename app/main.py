@@ -18,6 +18,7 @@ from .models import (
     CancelOut,
     LeaseIn,
     LeaseOut,
+    PauseOut,
     ReportIn,
     WorkflowCreatedOut,
     WorkflowIn,
@@ -130,6 +131,24 @@ def create_app() -> FastAPI:
     )
     def cancel_workflow(workflow_id: str, conn=Depends(get_conn)):
         return service.cancel_workflow(conn, workflow_id, now_iso())
+
+    @app.post(
+        "/workflows/{workflow_id}/pause",
+        response_model=PauseOut,
+        tags=["workflows"],
+    )
+    def pause_workflow(workflow_id: str, conn=Depends(get_conn)):
+        """暂停调度：保留任务图/尝试次数/已发租约，仅停止新领取。"""
+        return service.set_workflow_paused(conn, workflow_id, True, now_iso())
+
+    @app.post(
+        "/workflows/{workflow_id}/resume",
+        response_model=PauseOut,
+        tags=["workflows"],
+    )
+    def resume_workflow(workflow_id: str, conn=Depends(get_conn)):
+        """恢复调度：按依赖关系与原尝试次数继续领取。"""
+        return service.set_workflow_paused(conn, workflow_id, False, now_iso())
 
     # ------------------------------------------------------------------ #
     # 领取 / 上报

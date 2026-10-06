@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS workflows (
     idempotency_key TEXT NOT NULL UNIQUE,
     request_hash    TEXT NOT NULL,
     status          TEXT NOT NULL,
+    paused          INTEGER NOT NULL DEFAULT 0,
     default_max_attempts INTEGER NOT NULL,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
@@ -114,10 +115,22 @@ CREATE TABLE IF NOT EXISTS report_receipts (
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库就地升级（幂等）：为既有数据库补充新增列，数据保持不变。"""
+    cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(workflows)")
+    }
+    if "paused" not in cols:
+        conn.execute(
+            "ALTER TABLE workflows ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def init_db(settings: Settings | None = None) -> None:
-    """幂等建表，启动与 Compose 首次运行时自动初始化。"""
+    """幂等建表 + 老库迁移，启动与 Compose 首次运行时自动初始化。"""
     conn = connect(settings)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
