@@ -325,10 +325,19 @@ def finalize_workflow(conn: sqlite3.Connection, workflow_id: str, now: str) -> N
         new_status = "failed"
 
     if new_status is not None and new_status != wf["status"]:
-        conn.execute(
-            "UPDATE workflows SET status = ?, updated_at = ? WHERE id = ?",
-            (new_status, now, workflow_id),
-        )
+        if new_status in ("succeeded", "failed"):
+            # 暂停期间任务全部终结：工作流仍进入对应终态，
+            # 暂停标记随终态清除（终态恒为未暂停）。
+            conn.execute(
+                "UPDATE workflows SET status = ?, paused = 0, updated_at = ? "
+                "WHERE id = ?",
+                (new_status, now, workflow_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE workflows SET status = ?, updated_at = ? WHERE id = ?",
+                (new_status, now, workflow_id),
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -360,10 +369,13 @@ def claim_task(
                     "workflow_not_found", "工作流不存在", 404
                 )
 
-        # 依赖全部成功的 pending 任务；NOT EXISTS 保证任依赖未成功即不可领
+        # 依赖全部成功的 pending 任务；NOT EXISTS 保证任依赖未成功即不可领。
+        # JOIN workflows ... w.paused = 0：暂停工作流的任务两种领取方式
+        # 都不可再领取（已领取任务的租约与上报不受影响）。
         sql = (
             "SELECT t.id, t.workflow_id FROM tasks t "
-            "WHERE t.status = 'pending' "
+            "JOIN workflows w ON w.id = t.workflow_id "
+            "WHERE t.status = 'pending' AND w.paused = 0 "
             + ("AND t.workflow_id = ? " if workflow_id else "")
             + "AND NOT EXISTS ("
             "  SELECT 1 FROM task_dependencies d "
@@ -586,7 +598,8 @@ def cancel_workflow(
 
         expire_leases(conn, now)
         conn.execute(
-            "UPDATE workflows SET status = 'cancelled', updated_at = ? WHERE id = ?",
+            "UPDATE workflows SET status = 'cancelled', paused = 0, "
+            "updated_at = ? WHERE id = ?",
             (now, workflow_id),
         )
         cur = conn.execute(
@@ -601,6 +614,82 @@ def cancel_workflow(
             "status": "cancelled",
             "cancelled_tasks": cur.rowcount,
             "updated_at": now,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# 暂停 / 恢复
+# --------------------------------------------------------------------------- #
+def _conflict_if_terminal(wf: sqlite3.Row) -> None:
+    if wf["status"] in ("succeeded", "failed", "cancelled"):
+        raise ServiceError(
+            "workflow_terminal",
+            f"工作流已处于终态 {wf['status']}，不能暂停或恢复",
+            409,
+            {"status": wf["status"]},
+        )
+
+
+def pause_workflow(
+    conn: sqlite3.Connection, workflow_id: str, now: str
+) -> dict[str, Any]:
+    """暂停调度：保留任务图、尝试次数与已发租约，仅关闭两种领取。
+
+    重复暂停幂等；对已终结/已取消工作流返回 409 明确冲突。
+    不触碰已领取任务：其租约内上报、到期重试与失败级联规则照旧。
+    """
+    with transaction(conn):
+        wf = conn.execute(
+            "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if wf is None:
+            raise ServiceError("workflow_not_found", "工作流不存在", 404)
+        _conflict_if_terminal(wf)
+
+        if not wf["paused"]:
+            conn.execute(
+                "UPDATE workflows SET paused = 1, updated_at = ? WHERE id = ?",
+                (now, workflow_id),
+            )
+            updated_at = now
+        else:
+            updated_at = wf["updated_at"]
+        return {
+            "id": workflow_id,
+            "status": wf["status"],
+            "paused": True,
+            "updated_at": updated_at,
+        }
+
+
+def resume_workflow(
+    conn: sqlite3.Connection, workflow_id: str, now: str
+) -> dict[str, Any]:
+    """恢复调度：按依赖关系与原尝试次数继续领取。
+
+    重复恢复幂等；对已终结/已取消工作流返回 409 明确冲突。
+    """
+    with transaction(conn):
+        wf = conn.execute(
+            "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if wf is None:
+            raise ServiceError("workflow_not_found", "工作流不存在", 404)
+        _conflict_if_terminal(wf)
+
+        if wf["paused"]:
+            conn.execute(
+                "UPDATE workflows SET paused = 0, updated_at = ? WHERE id = ?",
+                (now, workflow_id),
+            )
+            updated_at = now
+        else:
+            updated_at = wf["updated_at"]
+        return {
+            "id": workflow_id,
+            "status": wf["status"],
+            "paused": False,
+            "updated_at": updated_at,
         }
 
 
@@ -671,6 +760,7 @@ def _load_detail(conn: sqlite3.Connection, workflow_id: str) -> dict[str, Any]:
     return {
         "id": wf["id"],
         "status": wf["status"],
+        "paused": bool(wf["paused"]),
         "idempotency_key": wf["idempotency_key"],
         "default_max_attempts": wf["default_max_attempts"],
         "created_at": wf["created_at"],

@@ -69,6 +69,9 @@ class TaskOut(BaseModel):
 class WorkflowOut(BaseModel):
     id: str
     status: WorkflowStatus
+    paused: bool = Field(
+        ..., description="是否处于暂停中（与 status 正交；终态工作流恒为 false）"
+    )
     idempotency_key: str
     default_max_attempts: int
     created_at: str
@@ -107,6 +110,17 @@ class CancelOut(BaseModel):
     status: WorkflowStatus
     cancelled_tasks: int
     updated_at: str
+
+
+class PauseOut(BaseModel):
+    id: str
+    status: WorkflowStatus
+    paused: bool
+    updated_at: str
+
+
+class ResumeOut(PauseOut):
+    pass
 
 
 class ErrorOut(BaseModel):

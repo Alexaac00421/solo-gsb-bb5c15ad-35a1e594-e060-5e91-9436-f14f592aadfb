@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS workflows (
     idempotency_key TEXT NOT NULL UNIQUE,
     request_hash    TEXT NOT NULL,
     status          TEXT NOT NULL,
+    -- 暂停标记与 status 正交：暂停不改状态、不动任务图/尝试次数/租约，
+    -- 仅阻止两种领取；落库保证服务重启后暂停状态保持。
+    paused          INTEGER NOT NULL DEFAULT 0,
     default_max_attempts INTEGER NOT NULL,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
@@ -115,9 +118,20 @@ CREATE TABLE IF NOT EXISTS report_receipts (
 
 
 def init_db(settings: Settings | None = None) -> None:
-    """幂等建表，启动与 Compose 首次运行时自动初始化。"""
+    """幂等建表，启动与 Compose 首次运行时自动初始化。
+
+    对早期无 ``paused`` 列的数据库做幂等就地迁移；状态/租约数据原样保留。
+    """
     conn = connect(settings)
     try:
         conn.executescript(SCHEMA)
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(workflows)").fetchall()
+        }
+        if "paused" not in columns:
+            conn.execute(
+                "ALTER TABLE workflows ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
+            )
     finally:
         conn.close()
